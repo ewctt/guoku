@@ -1,0 +1,525 @@
+// ==UserScript==
+// @name         开卷写源助手
+// @name:zh-CN   开卷写源助手
+// @namespace    https://greasyfork.org/scripts/kaijuan-material
+// @version      1.1.0
+// @description  手机影视站写源素材采集：点选分类/卡片/详情/筛选，清除透明点击劫持层，导出 materials.txt。适用于 zjuba2 等 MacCMS 站。
+// @description:zh-CN 手机影视站写源素材采集：点选分类/卡片/详情/筛选，清除透明点击劫持层，导出 materials.txt。
+// @author       kaijuan
+// @license      MIT
+// @match        *://*/*
+// @exclude      *://greasyfork.org/*
+// @exclude      *://*.greasyfork.org/*
+// @run-at       document-idle
+// @grant        none
+// @inject-into  page
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // 避免在约框架/后台页重复注入
+  if (window.top !== window.self) return;
+  if (document.getElementById('kj-root')) return;
+
+  // ========== 清除 zjuba2 类「底部透明 touchend 劫持层」==========
+  // class=prkxcxuu_b · opacity≈0.01 · touchend → location 跳 ezze0ct.com
+  function killClickHijack() {
+    try {
+      document.querySelectorAll('.prkxcxuu_b, [class*="prkxcxuu"]').forEach(function (el) {
+        try { el.remove(); } catch (e) {}
+      });
+      var vh = window.innerHeight || 600;
+      var divs = document.getElementsByTagName('div');
+      for (var i = divs.length - 1; i >= 0; i--) {
+        var el = divs[i];
+        if (!el || !el.parentNode) continue;
+        if (el.id && String(el.id).indexOf('kj-') === 0) continue;
+        if (el.closest && el.closest('#kj-root')) continue;
+        var st;
+        try { st = getComputedStyle(el); } catch (e) { continue; }
+        if (!st || st.position !== 'fixed') continue;
+        var op = parseFloat(st.opacity);
+        if (isNaN(op) || op > 0.08) continue;
+        var text = (el.innerText || '').replace(/\s+/g, '');
+        if (text.length > 0) continue;
+        if (el.querySelector && el.querySelector('img,video,iframe,input,button,a')) continue;
+        var r;
+        try { r = el.getBoundingClientRect(); } catch (e2) { continue; }
+        if (!r || r.width < 8 || r.height < 8) continue;
+        if (r.top < vh * 0.2) continue;
+        try { el.remove(); } catch (e3) {}
+      }
+    } catch (e) {}
+  }
+
+  killClickHijack();
+  setInterval(killClickHijack, 600);
+
+  var collecting = false;
+  try {
+    var _assign = window.location.assign.bind(window.location);
+    var _replace = window.location.replace.bind(window.location);
+    function badUrl(u) {
+      return /ezze0ct\.com|4734gc\./i.test(String(u || ''));
+    }
+    window.location.assign = function (u) {
+      if (collecting && badUrl(u)) return;
+      return _assign(u);
+    };
+    window.location.replace = function (u) {
+      if (collecting && badUrl(u)) return;
+      return _replace(u);
+    };
+  } catch (e) {}
+
+  // ========== 素材 ==========
+  var MAT_KEY = 'kaijuan_mat_v1';
+  var modes = [
+    { key: 'nav', label: '①分类' },
+    { key: 'card', label: '②卡片' },
+    { key: 'detail', label: '③详情' },
+    { key: 'search', label: '④搜索URL' },
+    { key: 'page2', label: '⑤翻页URL' },
+    { key: 'filter', label: '⑥筛选' },
+    { key: 'filterUrls', label: '⑦筛选URL' }
+  ];
+  var mode = 'nav';
+  var currentEl = null;
+  var currentHtml = '';
+  var picking = false;
+
+  function loadMat() {
+    try { return JSON.parse(localStorage.getItem(MAT_KEY) || '{}'); } catch (e) { return {}; }
+  }
+  function saveMatObj(obj) {
+    try { localStorage.setItem(MAT_KEY, JSON.stringify(obj)); } catch (e) {}
+  }
+
+  function getCleanHtml(el) {
+    if (!el) return '';
+    try {
+      var clone = el.cloneNode(true);
+      clone.querySelectorAll('script,style,noscript').forEach(function (n) { n.remove(); });
+      var html = clone.outerHTML || '';
+      if (html.length > 120000) html = html.slice(0, 120000) + '\n<!-- truncated -->';
+      return html;
+    } catch (e) {
+      return el.outerHTML || '';
+    }
+  }
+
+  function toSearchUrl(u) {
+    u = String(u || location.href);
+    u = u.replace(/([?&](?:wd|q|word|keyword|key|search|s)=)[^&]*/i, '$1{key}');
+    if (u.indexOf('{key}') < 0) u += (u.indexOf('?') >= 0 ? '&' : '?') + 'wd={key}';
+    return u;
+  }
+  function toPageUrl(u) {
+    u = String(u || location.href);
+    u = u.replace(/([?&](?:page|p|pg)=)\d+/i, '$1{page}');
+    u = u.replace(/\/page\/\d+/i, '/page/{page}');
+    if (u.indexOf('{page}') < 0) u += (u.indexOf('?') >= 0 ? '&' : '?') + 'page={page}';
+    return u;
+  }
+
+  // ========== UI（手机大按钮）==========
+  function sty(el, o) {
+    for (var k in o) el.style[k] = o[k];
+  }
+
+  var root = document.createElement('div');
+  root.id = 'kj-root';
+  sty(root, {
+    all: 'initial',
+    position: 'fixed',
+    left: '0',
+    top: '0',
+    width: '0',
+    height: '0',
+    zIndex: '2147483647',
+    fontFamily: '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif',
+    pointerEvents: 'none'
+  });
+
+  var fab = document.createElement('div');
+  fab.textContent = '采集';
+  sty(fab, {
+    pointerEvents: 'auto',
+    position: 'fixed',
+    right: '12px',
+    bottom: '28%',
+    width: '56px',
+    height: '56px',
+    borderRadius: '18px',
+    background: 'linear-gradient(135deg,#667eea,#764ba2)',
+    color: '#fff',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '15px',
+    fontWeight: '700',
+    boxShadow: '0 4px 18px rgba(0,0,0,.4)',
+    cursor: 'pointer',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    touchAction: 'manipulation'
+  });
+
+  var panel = document.createElement('div');
+  sty(panel, {
+    pointerEvents: 'auto',
+    position: 'fixed',
+    left: '0',
+    right: '0',
+    bottom: '0',
+    maxHeight: '48vh',
+    background: '#1c1c1e',
+    color: '#f5f5f7',
+    borderRadius: '16px 16px 0 0',
+    display: 'none',
+    flexDirection: 'column',
+    boxShadow: '0 -8px 32px rgba(0,0,0,.5)',
+    overflow: 'hidden',
+    touchAction: 'manipulation'
+  });
+
+  var head = document.createElement('div');
+  sty(head, {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '12px 14px',
+    borderBottom: '1px solid #333',
+    flexShrink: '0'
+  });
+  var title = document.createElement('b');
+  title.textContent = '开卷素材采集';
+  sty(title, { fontSize: '16px', color: '#f5f5f7' });
+  var btnClose = document.createElement('button');
+  btnClose.type = 'button';
+  btnClose.textContent = '关闭';
+  sty(btnClose, {
+    background: '#3a3a3c', color: '#fff', border: 'none',
+    borderRadius: '10px', padding: '8px 14px', fontSize: '14px'
+  });
+  head.appendChild(title);
+  head.appendChild(btnClose);
+
+  var modesBar = document.createElement('div');
+  sty(modesBar, {
+    display: 'flex', flexWrap: 'wrap', gap: '6px',
+    padding: '10px 12px 4px', flexShrink: '0'
+  });
+  var modeBtns = {};
+  modes.forEach(function (m) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = m.label;
+    sty(b, {
+      flex: '1 1 22%', minWidth: '22%', padding: '10px 2px', borderRadius: '10px',
+      border: 'none', fontSize: '12px', background: '#2c2c2e', color: '#ddd'
+    });
+    b.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      mode = m.key;
+      Object.keys(modeBtns).forEach(function (k) {
+        modeBtns[k].style.background = k === mode ? '#667eea' : '#2c2c2e';
+        modeBtns[k].style.color = k === mode ? '#fff' : '#ddd';
+      });
+      if (mode === 'search') {
+        currentHtml = toSearchUrl(location.href);
+        pre.textContent = currentHtml;
+        tip.textContent = '已生成搜索URL，点「保存」';
+      } else if (mode === 'page2' || mode === 'filterUrls') {
+        currentHtml = toPageUrl(location.href);
+        pre.textContent = currentHtml;
+        tip.textContent = '已生成翻页/筛选URL，点「保存」';
+      } else {
+        tip.textContent = '点「点选」后，再点网页目标区域';
+      }
+    });
+    modeBtns[m.key] = b;
+    modesBar.appendChild(b);
+  });
+  modeBtns.nav.style.background = '#667eea';
+  modeBtns.nav.style.color = '#fff';
+
+  var tip = document.createElement('div');
+  tip.textContent = '点「点选」→ 点网页 →「扩大」→「保存」→「导出TXT」';
+  sty(tip, {
+    padding: '4px 12px 8px', fontSize: '12px', color: '#9a9aa0', flexShrink: '0'
+  });
+
+  var preWrap = document.createElement('div');
+  sty(preWrap, {
+    flex: '1 1 auto', overflow: 'auto', padding: '0 12px',
+    maxHeight: '16vh', minHeight: '48px', WebkitOverflowScrolling: 'touch'
+  });
+  var pre = document.createElement('pre');
+  pre.textContent = '等待选择...';
+  sty(pre, {
+    margin: '0', fontSize: '11px', lineHeight: '1.45', color: '#7dffa0',
+    whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+    fontFamily: 'Menlo,Consolas,monospace'
+  });
+  preWrap.appendChild(pre);
+
+  var actions = document.createElement('div');
+  sty(actions, {
+    display: 'flex', flexWrap: 'wrap', gap: '8px',
+    padding: '10px 12px calc(12px + env(safe-area-inset-bottom, 0px))',
+    borderTop: '1px solid #333', flexShrink: '0'
+  });
+
+  function mkBtn(text, bg, fg) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    sty(b, {
+      flex: '1 1 30%', minWidth: '30%', padding: '14px 6px', borderRadius: '12px',
+      border: 'none', fontSize: '14px', fontWeight: '600',
+      background: bg, color: fg || '#fff'
+    });
+    return b;
+  }
+
+  var btnPick = mkBtn('点选', '#667eea');
+  var btnUp = mkBtn('扩大', '#3a3a3c');
+  var btnSave = mkBtn('保存', '#30d158', '#000');
+  var btnExport = mkBtn('导出TXT', '#0a84ff');
+  var btnClear = mkBtn('清除', '#ff453a');
+
+  [btnPick, btnUp, btnSave, btnExport, btnClear].forEach(function (b) {
+    actions.appendChild(b);
+  });
+
+  panel.appendChild(head);
+  panel.appendChild(modesBar);
+  panel.appendChild(tip);
+  panel.appendChild(preWrap);
+  panel.appendChild(actions);
+  root.appendChild(fab);
+  root.appendChild(panel);
+  (document.documentElement || document.body).appendChild(root);
+
+  var lastHL = null;
+  function clearHL() {
+    if (!lastHL) return;
+    try {
+      lastHL.style.outline = '';
+      lastHL.style.outlineOffset = '';
+      lastHL.style.background = '';
+    } catch (e) {}
+    lastHL = null;
+  }
+  function setHL(el) {
+    clearHL();
+    if (!el) return;
+    lastHL = el;
+    try {
+      el.style.outline = '3px solid #667eea';
+      el.style.outlineOffset = '2px';
+      el.style.background = 'rgba(102,126,234,.12)';
+    } catch (e) {}
+  }
+
+  function openPanel() {
+    panel.style.display = 'flex';
+    collecting = true;
+    killClickHijack();
+  }
+  function closePanel() {
+    panel.style.display = 'none';
+    picking = false;
+    collecting = false;
+    clearHL();
+  }
+
+  fab.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (panel.style.display === 'flex') closePanel();
+    else openPanel();
+  }, true);
+
+  btnClose.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    closePanel();
+  }, true);
+
+  btnPick.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (mode === 'search' || mode === 'page2' || mode === 'filterUrls') {
+      tip.textContent = 'URL模式：直接点「保存」';
+      return;
+    }
+    picking = true;
+    collecting = true;
+    killClickHijack();
+    tip.textContent = '点选中：请点网页上的目标（分类/卡片/详情/筛选）';
+  }, true);
+
+  // 手机用 touchend 点选，并立刻干掉劫持层
+  function onPick(e) {
+    if (!picking) return;
+    if (e.target && root.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    killClickHijack();
+    var t = e.target;
+    if (t && t.nodeType === 3) t = t.parentElement;
+    // 忽略刚杀的空节点
+    if (!t || t === document.body || t === document.documentElement) return;
+    currentEl = t;
+    currentHtml = getCleanHtml(t);
+    setHL(t);
+    pre.textContent = currentHtml || '(空)';
+    picking = false;
+    tip.textContent = '已选中，可「扩大」或「保存」';
+    openPanel();
+  }
+  document.addEventListener('click', onPick, true);
+  document.addEventListener('touchend', onPick, true);
+
+  btnUp.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    killClickHijack();
+    if (!currentEl) {
+      tip.textContent = '请先点选';
+      return;
+    }
+    var p = currentEl.parentElement;
+    if (!p || p === document.body || p === document.documentElement) {
+      tip.textContent = '不能再往上了';
+      return;
+    }
+    currentEl = p;
+    currentHtml = getCleanHtml(p);
+    setHL(p);
+    pre.textContent = currentHtml || '(空)';
+    tip.textContent = '已扩大到父级';
+  }, true);
+
+  btnSave.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var mat = loadMat();
+    var val = (currentHtml || '').trim();
+    if (!val) {
+      tip.textContent = '没有可保存内容';
+      return;
+    }
+    if (mode === 'filterUrls') {
+      var prev = (mat.filterUrls || '').trim();
+      if (!(prev && prev.indexOf(val) >= 0)) {
+        mat.filterUrls = prev ? prev + '\n' + val : val;
+      }
+    } else {
+      mat[mode] = val;
+    }
+    mat.host = location.origin;
+    mat.pageUrl = location.href;
+    saveMatObj(mat);
+    var lab = modes.filter(function (m) { return m.key === mode; })[0];
+    tip.textContent = '已保存 ' + (lab ? lab.label : mode);
+  }, true);
+
+  btnClear.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    currentEl = null;
+    currentHtml = '';
+    clearHL();
+    pre.textContent = '等待选择...';
+    tip.textContent = '已清除当前选区';
+  }, true);
+
+  function buildTxt() {
+    var mat = loadMat();
+    return [
+      '# 开卷写源素材包',
+      '# 素材 + 开卷海阔指令 → 海阔JSON；素材 + 开卷默影视指令 → Py源',
+      'target_hint: both',
+      'host: ' + (mat.host || location.origin),
+      'pageUrl: ' + (mat.pageUrl || location.href),
+      'ua: Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36',
+      '',
+      '## 素材1 一级分类',
+      mat.nav || '（空）',
+      '',
+      '## 素材2 列表卡片 DOM',
+      '```html',
+      mat.card || '（空）',
+      '```',
+      '',
+      '## 素材3 详情选集 DOM',
+      '```html',
+      mat.detail || '（空）',
+      '```',
+      '',
+      '## 素材4 搜索URL（{key}=关键词）',
+      '```text',
+      mat.search || '（空）',
+      '```',
+      '',
+      '## 素材5 翻页URL（{page}=页码）',
+      '```text',
+      mat.page2 || '（空）',
+      '```',
+      '',
+      '## 素材6 筛选面板（可空）',
+      mat.filter || '（空）',
+      '',
+      '## 素材7 带筛选URL（可空，每行一条）',
+      '```text',
+      mat.filterUrls || '（空）',
+      '```',
+      ''
+    ].join('\n');
+  }
+
+  btnExport.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var text = buildTxt();
+    var copied = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch (err) {}
+    if (!copied) {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        copied = true;
+      } catch (err2) {}
+    }
+    try {
+      var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = '开卷写源_素材.txt';
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 1500);
+    } catch (err3) {}
+    tip.textContent = copied
+      ? ('已复制并导出 TXT（' + text.length + ' 字）')
+      : '已尝试导出，请检查下载或手动复制';
+  }, true);
+
+  window.addEventListener('load', killClickHijack);
+})();
